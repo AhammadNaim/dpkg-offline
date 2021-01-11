@@ -1,0 +1,585 @@
+#!/bin/bash
+# This file is part of dpkg_offline.
+#
+# Copyright 2013-2014 Canonical Ltd.
+# Written by:
+#   Daniel Manrique <daniel.manrique@canonical.com>
+#
+# Dpkg_offline is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3,
+# as published by the Free Software Foundation.
+#
+# Dpkg_offline is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Dpkg_offline. If not, see <http://www.gnu.org/licenses/>.
+
+#REQUIREMENTS:
+# sudo apt-get install genisoimage mtools squashfs-tools apt-utils curl
+#man apt.conf and man apt-get
+#
+##########
+# We need to set the following APT variables
+##########
+#/var/cache/apt/archives/
+#    Storage area for retrieved package files.
+#    Configuration Item: Dir::Cache::Archives.
+#Set this to anything really
+
+#/var/lib/apt/lists/
+#    Storage area for state information for each package resource specified in sources.list(5).
+#    Configuration Item: Dir::State::Lists.
+#Set this to a directory containing lists.
+
+
+#Dir::Etc - location of configuration files (e.g. /etc/apt).
+
+#dpkg options
+#--admindir=dir
+#              Change default administrative directory,  which  contains
+#              many   files   that  give  information  about  status  of
+#              installed or uninstalled  packages,  etc.   (Defaults  to
+#              /var/lib/dpkg)
+#Architecture note: We can never use one installation to generate all
+#architectures, the reason is that we always need to start with an arch-
+#specific apt state directory, because that's what gives me the list of
+#preinstalled packages for an image. Trying to set the architecture is
+#effectively asking apt-get to download all absent packages for the other
+#architecture, which is not what we want (i.e. it'd be duplicating the set of
+#base packages for the image).
+#We DO NEED to set the architecture when fetching packages from a foreign
+#architecture image (i.e. if my host system is i386 but I got the data files
+#from amd64 or armhf image, I need Apt::Architecture set to the actual arch
+#of the data files I downloaded.
+
+# Design of error recovery functionality
+# A global cleanup function will delete all temporary directories.
+# This happens only if all steps succeeded AND if --no-cleanup was NOT specified.
+# the log/ directory and the final tar.gz will be kept.
+
+function dpkg_offline_usage(){
+cat << EOD
+Usage: dpkg_offline [-d] [-f] [OPTION]... <base-iso-or-img> <packages-to-install>
+
+dpkg_offline downloads a set of .deb packages needed to install all of the
+given <packages-to-download>, with their dependencies satisfied, on an
+installation done from <base-iso>.
+
+It effectively obtains the set of packages that would be downloaded if
+apt-get -dy <packages-to-download> were run on a system just installed from
+<base-iso>.
+
+It supports
+    - Ubuntu desktop, for releases 12.04 onwards, using either Live CD ISO or
+      armhf .img with vfat filesystems.
+    - Ubuntu server, for releases 12.10 onwards, using Live CD ISO or armhf .img
+      with vfat filesystems.
+    - Ubuntu 12.04 server not yet supported :(
+    - Ubuntu server, for 12.04 and its point releases, in tar.gz format ONLY (see
+      README file for description of this format)
+
+It can download packages for any architecture as long as either an iso or img
+image, or tar.gz "seed" file,  is available. Note that the specified image must
+match the desired architecture, and will be auto-determined based on the image.
+
+OPTIONS
+
+    -d debug. Print extra debugging information.
+
+    -r additional-repo-file
+
+        Additional PPAs can be specified in a file that will be added to the
+        apt sources prior to installation. The special @@RELEASE@@ variable or
+        the YOUR_UBUNTU_VERSION_HERE string will be substituted by the image's
+        release name. Private PPAs are supported, using the encrypted password
+        syntax as provided by launchpad's PPA details page; they can be copied
+        verbatim from Launchpad PPA details pages thanks to the above-mentioned
+        variable substitution. To specify multiple files, use -r for each file.
+        Filenames given should not contain spaces.
+
+    -e extras-file
+
+        Additional files to add to the offline tarball can be listed, one
+        per line, in the given text file. These are copied to the tarball prior
+        to generating the Packages.gz so this can include custom .debs or
+        additional helper scripts. Note that this is in addition to the
+        included-by-default add_offline_repository script. Also, note that this
+        can include URLs which will be fetched with curl.
+
+    -t final-tarball-name
+
+        Name for the final result tarball. If not given, it will be put in the
+        current directory with a reasonable default name.
+
+    -n No cleanup, to skip the final cleanup-on-success phase.
+
+    -f Force execution even if a required executable is not found. Use it if you
+       know you won't need one of the possible dependencies; i.e. mtools is not
+       present but you don't need to build an arm image, or curl is missing but
+       you don't have an extra file to be fetched with http.
+
+EOD
+}
+
+
+function step05(){
+    if [ "$UID" = "0" ]; then
+        echo "You're running as root, and you shouldn't, because"
+        echo "this script may destroy your apt configuration."
+        exit 1
+    fi
+}
+
+function step07(){
+    ARGS=$(getopt -o "at:e:hndr:f" -l "apt-cache,tarball,extras-file,help,no-cleanup,debug,repo-file,force" -n "dpkg_offline" -- "$@")
+    #Bad arguments
+    if [ $? -ne 0 ]; then
+        echo "Bad arguments"
+        exit 1
+    fi
+    eval set -- "$ARGS"
+    #Parse the options
+    while true; do
+        case "$1" in
+            -d|--debug) debug=1; shift ;;
+            -a|--apt-cache) param_apt_cache=1; shift ;;
+            -n|--no-cleanup) param_no_cleanup=1; shift ;;
+            -h|--help) dpkg_offline_usage; exit 0 ;;
+            -r|--repo-file) param_repo_file="$param_repo_file $2"; shift 2;;
+            -e|--extras-file) param_extra_file=$2; shift 2;;
+            -t|--tarball) param_tarball=$2; shift 2;;
+            -f|--force) param_force_run=1; shift ;;
+            --) shift; break ;;
+            *) echo "Internal error"; exit 1 ;;
+        esac
+    done
+#Mandatory arguments
+param_iso_image=$1
+param_packages_to_install=$2
+    if [ -z "$param_iso_image" -o -z "$param_packages_to_install" ]; then
+        echo "Base ISO image and list of packages to install are mandatory."
+        dpkg_offline_usage
+        exit 2
+    fi
+    if [ -n "$debug" ]; then
+        echo "---------- [ Running configuration ] ----------"
+        echo "Original iso image: $param_iso_image"
+        echo "Packages to install: [$param_packages_to_install]"
+        if [ -n "$param_repo_file" ]; then
+            echo "Files with additional repositories: $param_repo_file"
+        fi
+        if [ -n "$param_extra_file" ]; then
+            echo "List of extra files: $param_extra_file"
+        fi
+        if [ -n "$param_tarball" ]; then
+            echo "Destination tarball name: $param_tarball"
+        fi
+        if [ -n "$param_no_cleanup" ]; then
+            echo "User requested skipping final cleanup."
+        fi
+         if [ -n "$param_apt_cache" ]; then
+            echo "Use local apt-cacher-ng (port 3142)"
+        fi
+        echo
+    fi
+}
+
+function step08(){
+    # Check requirements, and exit if any is missing unless the user specified
+    # to ignore this.
+    for req in unsquashfs mcopy isoinfo curl; do
+        [ -x "$(which $req)" ] || missingreqs="$missingreqs $req"
+    done
+
+    if [ -n "$missingreqs" ]; then
+        echo "Required binaries are missing: $missingreqs"
+        echo "Perhaps you need to install them?"
+        echo "On Ubuntu or Debian, you need the following packages installed:"
+        echo "curl mtools genisoimage squashfs-tools"
+
+        if [ -n "$param_force_run" ]; then
+            echo "Dependencies missing, but user forced the run. Here I go..."
+        else
+            exit 1
+        fi
+    fi
+}
+
+
+function step10(){
+    #Create all the directories we need for the process
+    [ -n "$debug" ] && echo "Creating directories"
+    #Everything we do will live under this directory.
+    BASE=$(mktemp -d --tmpdir dpkgoffline.XXXXX)
+    if [ $? -ne 0 ]; then
+        echo "Unable to create temporary directory: $BASE"
+        return 1
+    fi
+    #These constitute a mini-root for needed apt and dpkg
+    #files and stuff.
+    LOG_DIR=$BASE/log
+    MINI_ROOT=$BASE/mini-root
+    OFFLINE_APT_ETC=$MINI_ROOT/etc/apt
+    OFFLINE_APT_ARCHIVES=$MINI_ROOT/var/cache/apt/archives
+    OFFLINE_APT_DIR=$MINI_ROOT/var/cache/apt
+    OFFLINE_LOG=$MINI_ROOT/var/log
+    OFFLINE_APT_LISTS=$MINI_ROOT/var/lib/apt/lists
+    OFFLINE_DPKG_LIB=$MINI_ROOT/var/lib/dpkg
+    #Other needed dirs
+    ISO_EXTRACT=$BASE/iso-extract
+    SQUASHFS_EXTRACT=$BASE/squashfs-extract
+    DATE_ID=`date +%Y%m%d`
+    REPO_DESTINATION=$BASE/apt-repo-$(basename $ISO_IMAGE)-$DATE_ID
+    for dir in $MINI_ROOT $OFFLINE_APT_ETC $OFFLINE_APT_ARCHIVES \
+               $OFFLINE_APT_DIR $OFFLINE_LOG $OFFLINE_APT_LISTS \
+               $OFFLINE_DPKG_LIB $ISO_EXTRACT $SQUASHFS_EXTRACT \
+               $LOG_DIR $REPO_DESTINATION; do
+        mkdir -p $dir
+    done
+
+}
+
+
+function step20(){
+    # Extract the iso image to a temporary directory
+    # We only care about the squashfs
+    if [ ! -d $ISO_EXTRACT ]; then
+        echo "$ISO_EXTRACT directory does not exist"
+        return 1
+    fi
+
+    local extension=$(echo "$ISO_IMAGE" | awk -F . '{print $NF}')
+    case "$extension" in
+        iso)
+            echo "Extracting squashfs from iso image to temporary (1 minute)"
+            if [ ! -x "$(which isoinfo)" ]; then
+                echo "isoinfo not found. It's in the genisoimage package."
+                return 1
+            fi
+            #Get the path for the squashfs and extract only that
+            SQUASHFS_PATH=$(isoinfo -R -i $ISO_IMAGE -f | grep -i filesystem.squashfs$)
+            if [ -z "$SQUASHFS_PATH" ]; then
+                echo "No squashfs found, wrong image? (maybe server 12.04 or older)"
+                return 1
+            fi
+            isoinfo -R -i $ISO_IMAGE -x "$SQUASHFS_PATH" > $ISO_EXTRACT/$(basename "$SQUASHFS_PATH")
+            RETVAL=$?
+            if [ $? -ne 0 ]; then
+                echo "Extracting $SQUASHFS_PATH from $ISO_IMAGE failed"
+                return 1
+            fi
+            local diskdefines_path=$(isoinfo -R -i $ISO_IMAGE -f | grep -i README.diskdefines)
+            isoinfo -R -i $ISO_IMAGE -x "$diskdefines_path" > $ISO_EXTRACT/$(basename "$diskdefines_path")
+            RETVAL=$?
+            if [ $? -ne 0 ]; then
+                echo "Extracting $diskdefines_path from $ISO_IMAGE failed"
+            fi
+            return $RETVAL
+            ;;
+        img)
+            echo "Extracting squashfs from img (partitioned) image to temporary (1 minute)"
+            [ -n "$debug" ] && echo "Assuming squashfs is in partition 2, type vfat, in /casper/filesystem.squashfs"
+             if [ ! -x "$(which mcopy)" ]; then
+                echo "mcopy not found. It's in the mtools package."
+                return 1
+            fi
+            echo "drive a: file=\"$ISO_IMAGE\" partition=2 # dpkg_offline" > $HOME/.mtoolsrc
+            # squashfs can be in casper/ or in install/ depending on whether it's server or desktop
+            for location in casper install; do
+                [ -n "$debug" ] && echo "Looking for squashfs in $location"
+                mcopy -n a:/${location}/filesystem.squashfs $ISO_EXTRACT/filesystem.squashfs >>$LOG_DIR/mcopy.log 2>&1
+                RETVAL=$?
+                if [ $RETVAL = 0 ]; then
+                    [ -n "$debug" ] && echo "Found it there!"
+                    break
+                fi
+            done
+            mcopy -n a:README.diskdefines $ISO_EXTRACT/README.diskdefines >>$LOG_DIR/mcopy.log 2>&1
+            sed -i '/# dpkg_offline/d' $HOME/.mtoolsrc
+            [ $RETVAL = 0 ] || echo "Extracting squashfs from $ISO_IMAGE failed, see $LOG_DIR/mcopy.log for details"
+            return $RETVAL
+            ;;
+        gz)
+            #TODO: Better check that this is a tar.gz (not just a gz)
+            echo "Extracting partial root from tar.gz"
+            tar -zxf "$ISO_IMAGE" -C $SQUASHFS_EXTRACT etc var README.diskdefines
+            RETVAL=$?
+            [ $RETVAL = 0 ] || echo "tar.gz seed file $ISO_IMAGE didn't contain expected files (etc var)"
+            cp $SQUASHFS_EXTRACT/README.diskdefines $ISO_EXTRACT
+            return $RETVAL
+            ;;
+        *)
+            echo "Unknown image format :("
+            return 1
+            ;;
+    esac
+
+}
+
+
+function step30(){
+    # Extract the squashfs (we only need some files) to
+    # another temporary directory.
+    # We need /etc and /var/lib from the squashfs.
+    SQUASHFS_FILE_PATH=$ISO_EXTRACT/filesystem.squashfs
+    # TODO: Validate that squashfs_file_path exists and is of type squashfs.
+    # TODO: Narrow down the list of files we need, especially from var,
+    # I think we only need /etc/apt, /etc/dpkg from etc.
+    # If SQUASHFS_EXTRACT already has etc and var, it means we used a 12.04
+    # tar.gz-format seed which doesn't need this step.
+    [ -d $SQUASHFS_EXTRACT/etc ] && echo "squashfs extraction not needed with tar.gz-format images"
+    [ -d $SQUASHFS_EXTRACT/etc ] && return 0
+    echo "Extracting needed files from squashfs (40 seconds)"
+    unsquashfs -n -f -d $SQUASHFS_EXTRACT $SQUASHFS_FILE_PATH \
+        "/etc" -e "/var/lib" >$LOG_DIR/unsquashfs.log 2>&1
+    RETVAL=$?
+    [ $RETVAL = 0 ] || echo "unsquashfs failed, see $LOG_DIR/unsquashfs.log for details."
+    return $RETVAL
+}
+
+
+function step40(){
+    [ -n "$debug" ] && echo "Trying to detect architecture and release..."
+    RETVAL=0
+    #Detect architecture
+    ISO_ARCHITECTURE=$(awk '/#define ARCH / { print $3 }' $ISO_EXTRACT/README.diskdefines)
+    if [ -z "$ISO_ARCHITECTURE" ]; then
+        echo "Couldn't detect architecture"
+        RETVAL=1
+    else
+        [ -n "$debug" ] && echo "Detected architecture $ISO_ARCHITECTURE"
+    fi
+    . $SQUASHFS_EXTRACT/etc/lsb-release
+    if [ $? ]; then
+       if [ -z $DISTRIB_CODENAME ]; then
+           echo "Couldn't detect codename"
+           RETVAL=1
+       else
+           [ -n "$debug" ] && echo "Detected codename $DISTRIB_CODENAME"
+       fi
+    else
+        echo "image's lsb-release file is missing?"
+        RETVAL=1
+    fi
+    [ $RETVAL = 0 ] || echo "Failed to detect architecture or release." 
+    return $RETVAL
+
+}
+
+
+function step50(){
+    #Copy extracted files from squashfs into their needed locations
+    echo "Copying needed files to mini-root (40 seconds)"
+    cp -a $SQUASHFS_EXTRACT/var/lib/dpkg ${MINI_ROOT}/var/lib
+    cp -a $SQUASHFS_EXTRACT/var/lib/apt/lists ${MINI_ROOT}/var/lib/apt
+    cp -a $SQUASHFS_EXTRACT/etc/apt ${MINI_ROOT}/etc
+    cp -a $SQUASHFS_EXTRACT/etc/dpkg ${MINI_ROOT}/etc
+    #TODO: Validate that some key files are where we expect them.
+}
+
+
+function step60(){
+    #Add any needed extra repositories to the temporary sources.list.d
+    #Also enable universe and multiverse
+    [ -n "$debug" ] && echo "Enabling universe and multiverse"
+    sed -i  's/main\s*\(.*\)$/main \1 universe multiverse/' $MINI_ROOT/etc/apt/sources.list
+    if [ -n "$CUSTOM_REPO_FILE" ]; then
+        CUSTOM_LIST=$MINI_ROOT/etc/apt/sources.list.d/dpkg-offline-added.list
+        for crf in $CUSTOM_REPO_FILE; do
+            if [ -f "$crf" ]; then
+                [ -n "$debug" ] && echo "Adding extra repositories from $crf to apt sources"
+                sed "s/@@RELEASE@@/$DISTRIB_CODENAME/;s/YOUR_UBUNTU_VERSION_HERE/$DISTRIB_CODENAME/" $crf >> $CUSTOM_LIST
+            fi
+        done
+    fi
+}
+
+
+function step70(){
+    local local_apt_cache_opt="-o Acquire::http::Proxy=http://localhost:3142"
+    local_apt_cache_opt="$local_apt_cache_opt -o Acquire::http::Proxy::private-ppa.launchpad.net=DIRECT"
+    #run apt-get update
+    echo "Running apt-get update (about 30 seconds)"
+    #TODO: Validate that all directories given here do exist
+    #TODO: Split out setting the variables into another function.
+    APT_OPTIONS="-o Dir::Etc=${OFFLINE_APT_ETC} \
+    -o Dir::Cache::Archives=${OFFLINE_APT_ARCHIVES} \
+    -o Dir::Cache=${OFFLINE_APT_DIR} \
+    -o Dir::State=${OFFLINE_APT_DIR} \
+    -o Dir::Log=${OFFLINE_LOG} \
+    -o Apt::Architecture=$ISO_ARCHITECTURE \
+    -o Dir::State::Lists=${OFFLINE_APT_LISTS} \
+    -o Dir::State::status=${OFFLINE_DPKG_LIB}/status \
+    -o DPkg::Options::='--admindir=${OFFLINE_DPKG_LIB}' \
+    -o Apt::Install-Recommends=1"
+    [ -n "$param_apt_cache" ] && APT_OPTIONS="$APT_OPTIONS $local_apt_cache_opt"
+    [ -n "$debug" ] && apt-config ${APT_OPTIONS} dump
+    # Use -qq for super-quiet update
+    apt-get -q ${APT_OPTIONS}  update >$LOG_DIR/apt-update.log 2>&1
+}
+
+function step80(){
+    #run apt-get install for requested packages.
+    #Note this will only get packages for the existing (single) architecture.
+    #This is because the repo in the image only has packages for one arch.
+    #TODO: Report possible misconfigured PPAs
+    #if some repos couldn't be updated.
+    #TODO: Check that every package in PACKAGE_LIST was indeed downloaded.
+    if [ -z "$APT_OPTIONS" ]; then
+        echo "Error, APT_OPTIONS not set, this shouldn't happen"
+        return 1
+    fi
+    echo "Running apt-get install $PACKAGE_LIST"
+    APT_INSTALL_OPTIONS="--allow-unauthenticated --download-only -y --force-yes"
+    apt-get -q ${APT_OPTIONS} ${APT_INSTALL_OPTIONS} install $PACKAGE_LIST >$LOG_DIR/apt-install.log 2>&1
+    RETVAL=$?
+    [ $RETVAL = 0 ] || echo "apt-get returned an eror, check $LOG_DIR/apt-install.log for details"
+    return $RETVAL
+}
+
+
+function step90(){
+    [ -n "$debug" ] && echo "Adding additional files to the repository"
+    # Add additional files, like auxiliary scripts, to REPO_DESTINATION.
+    DPKG_OFFLINE_LOCATION=$(cd $(dirname $0) && pwd)
+
+    if [ -f $DPKG_OFFLINE_LOCATION/scripts/add_offline_repository ]; then
+        cp $DPKG_OFFLINE_LOCATION/scripts/add_offline_repository $REPO_DESTINATION
+        (cd $REPO_DESTINATION; ln -s add_offline_repository uninstall_offline_repository)
+    fi
+    # Add any custom desired files from $LIST_EXTRA_FILE (-e parameter)
+    if [ -f "$LIST_EXTRA_FILE" ]; then
+        while read location; do
+            if [ -f "$location" ]; then
+                # Just copy local file
+                cp "$location" $REPO_DESTINATION
+            elif [ -n "$location" ]; then
+                # Try it with curl
+                (cd $REPO_DESTINATION && curl --remote-name "$location" --silent) 
+                RETVAL=$?
+                if [ $RETVAL -ne 0 ]; then
+                    echo "Unable to copy or download $location (curl error: $RETVAL)"
+                    return $RETVAL
+                fi
+            fi
+            [ -n "$debug" -a -n "$location" ] && echo "Adding $location to tarball"
+        done < "$LIST_EXTRA_FILE"
+    fi
+    return 0
+}
+
+function step95(){
+    # Add a metadata file to the repo
+    local target_data=$REPO_DESTINATION/target_data
+    echo "ISO_ARCHITECTURE=$ISO_ARCHITECTURE" >> $target_data
+    echo "DISTRIB_CODENAME=$DISTRIB_CODENAME" >> $target_data
+}
+
+function step100(){
+    #Create packages.gz or whatever I need to make the archives dir
+    #into an installable repo
+    echo "Creating repository"
+    if [ ! -x "$(which apt-ftparchive)" ]; then
+        echo "apt-ftparchive not found. It's in the apt-utils package."
+        return
+    fi
+    # TODO: Ensure that these commands succeed
+    cp $OFFLINE_APT_ARCHIVES/*deb $REPO_DESTINATION
+    (cd $REPO_DESTINATION && apt-ftparchive packages . |gzip > Packages.gz)
+}
+
+
+function step105(){
+    echo "Relocating repository to versioned directory"
+    PACKAGES_VERSIONS=""
+    # Figure out seed packages and versions, for tarball naming
+    for i in $PACKAGE_LIST; do
+        local package_full=$( (cd $REPO_DESTINATION && ls -1 ${i}_*.deb) )
+        package_full=$(echo $package_full |sed 's/\.deb//g')
+        PACKAGES_VERSIONS="$PACKAGES_VERSIONS $package_full"
+    done
+    PKG_ID=$(echo $PACKAGES_VERSIONS| sed 's/ /_/g;s/[^a-zA-Z0-9_-\.]//g')
+    FINAL_REPO=$BASE/$(basename $REPO_DESTINATION)-$PKG_ID
+    # Note that due to a bug in apt-get with paths longer than 256 characters,
+    # we truncate this PKG_ID section to 100 characters.
+    FINAL_REPO=$(echo $FINAL_REPO | head -c 100)
+    mkdir -p $FINAL_REPO
+    cp -a $REPO_DESTINATION/* $FINAL_REPO
+}
+
+function step110(){
+    echo "Compressing archives directory"
+    #Compress the archives dir
+    DEFAULT_TAR_LOCATION=$(basename $FINAL_REPO).tar.gz
+    local TLOC=${param_tarball:-$DEFAULT_TAR_LOCATION}
+    FINAL_TAR_LOCATION=$(cd $(dirname $TLOC); pwd)/$(basename $TLOC)
+    echo "Putting final tarball in $FINAL_TAR_LOCATION"
+    (cd $BASE && tar -czf ${FINAL_TAR_LOCATION} $(basename $FINAL_REPO))
+    if [ $? -ne 0 ]; then
+        echo "Problem when creating tar file ($FINAL_TAR_LOCATION)"
+        return 1
+    fi
+}
+
+
+function cleanup(){
+    rm -rf $MINI_ROOT $ISO_EXTRACT $SQUASHFS_EXTRACT $REPO_DESTINATION $FINAL_REPO
+}
+
+#TODO: Add a passthrough mode to run apt commands on the modified environment
+#TODO: Add subcommands: prepare, download, package.
+# Implement this with command-line options.
+# --extract-only (to extract squash-fs)
+# --unpack-only (to unpack the squashfs - maybe fuse these two?)
+# --prepare-only (to move extracted files and add repos)
+# --download-only (to only do the update and install)
+# --package-only (to only package the debs and create the mini archive)
+# Steps 0* are special because they exit on their own if their checks fail.
+# These are used for some precondition checking and early initialization.
+step05 # Check that I'm not root
+step07 "$@" # Process command-line options
+step08 # Check that required binaries are present
+ISO_IMAGE=$param_iso_image
+PACKAGE_LIST="$param_packages_to_install"
+CUSTOM_REPO_FILE="$param_repo_file"
+LIST_EXTRA_FILE="$param_extra_file"
+STEPS_TO_RUN="10 20 30 40 50 60 70 80 90 95 100 105 110"
+#STEPS_TO_RUN="10 40 60 70 80 90 100 105 110"
+for number in $STEPS_TO_RUN; do
+    eval step${number}
+    RETVAL=$?
+    if [ "$RETVAL" = "0" ]; then
+        #Add this to the cleanup stack and do next step
+        stack="step${number} $stack"
+    else
+        echo "---------- [ ERROR ] ----------"
+        echo "Step step${number} failed."
+        echo "See log files in $LOG_DIR for details on what failed."
+        FAILED_STEP=step${number}
+        # We failed, exit the for loop so we run cleanup.
+        break
+    fi
+done
+if [ -z "$param_no_cleanup" -a -z "$FAILED_STEP" ]; then
+    echo "Cleaning up..."
+    cleanup
+else
+    echo "I'm NOT cleaning up."
+    echo "Look in $BASE to see the temporary files and logs."
+fi
+#step10   create dirs. Do not comment this out, it sets needed vars.
+#step20   extract iso
+#step30   extract files from squashfs
+#step40   Get architecture and release codename. Don't comment out.
+#step50   Put extracted data files where I want them
+#step60   Add extra repos
+#step70   apt-get update. Do not comment out, sets APT variables.
+#step80   apt-get install
+#step90  Add extra files
+#step95  Add a destination data file, so we can check for mismatches later.
+#step100   Prepare Packages.gz and copy archives to repo destination
+#step105 Figure out packages and versions to name the final archive
+#step110  Compress the archives directory
