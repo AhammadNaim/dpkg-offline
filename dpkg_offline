@@ -129,7 +129,6 @@ function step05(){
     if [ "$UID" = "0" ]; then
         echo "You're running as root, and you shouldn't, because"
         echo "this script may destroy your apt configuration."
-        exit 1
     fi
 }
 
