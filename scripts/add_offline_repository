@@ -1,0 +1,148 @@
+#!/bin/bash
+
+# This script will be packaged alongside with a set of .deb packages.
+# The script takes care of copying the packages to a suitable location,
+# adding the required apt configuration to enable installation of packages
+# from this local repository, and optionally performing apt-get update and
+# installation of specified packages.
+#
+# The script can be invoked from anywhere, it will locate itself and set up
+# the repository with packages living in the same directory as itself.
+#
+# If invoked with the -r command-line parameter, or from a symlink in the
+# same directory called $UNINSTALL_NAME (see below), the script will instead
+# remove the apt configuration and local repository. It will not, however,
+# remove any installed packages.
+
+INSTALL_LOG=/tmp/add_offline_repository_install.log
+UNINSTALL_NAME="uninstall_offline_repository"
+
+if [ $UID != 0 ]; then
+     echo "Please run this using sudo $0, pkexec $0, or run as root."
+     exit 1
+fi
+
+ARGS=$(getopt -o "i:ur" -l "install,update,remove" -n "add_apt_repository" -- "$@")
+#Bad arguments
+if [ $? -ne 0 ]; then
+    echo "Bad arguments"
+    exit 1
+fi
+eval set -- "$ARGS"
+#Parse the options
+while true; do
+    case "$1" in
+        -u|--update) PARAM_UPDATE=1; shift ;;
+        -i|--install) PARAM_INSTALL_PACKAGES=$2; shift 2;;
+        -r|--remove) PARAM_REMOVE_REPO=1; shift ;;
+        --) shift; break ;;
+        *) echo "Internal error"; exit 1 ;;
+    esac
+done
+
+if [ $(basename "$0") ==  "$UNINSTALL_NAME" ]; then
+    PARAM_REMOVE_REPO=1
+fi
+
+
+
+# My directory tells me the name of the repository I want.
+APT_ADD_REPOSITORY_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+REPO_NAME=$(basename $APT_ADD_REPOSITORY_DIR)
+APT_ALLOW_UNAUTH_FILE=/etc/apt/apt.conf.d/90dpkg-offline-allow-unauthenticated
+
+if [ -z "$REPO_NAME" ]; then
+    echo "Invalid repository name"
+    exit 1
+fi
+
+# Prepare a couple of variables early, as we may need them
+# in the uninstall phase too.
+REPO_DIR=/var/local-apt-repositories/$REPO_NAME
+
+# If we were asked to uninstall, do it here and then exit.
+# Uninstall involves two steps: removing the cache and removing the
+# list file. As a third step, apt-get update to avoid confused users.
+if [ "$PARAM_REMOVE_REPO" == "1" ]; then
+    [ -d "$REPO_DIR" ] && rm $REPO_DIR/*
+    [ -d "$REPO_DIR" ] && rmdir $REPO_DIR
+    sed -i.bak "\|$REPO_DIR|d" /etc/apt/sources.list
+    [ -f $APT_ALLOW_UNAUTH_FILE ] && rm $APT_ALLOW_UNAUTH_FILE
+    debconf-apt-progress -- apt-get update
+    if [ ! -d "$REPO_DIR" ] || \
+       ! grep "$REPO_DIR" /etc/apt/sources.list || \
+       [ ! -f $APT_ALLOW_UNAUTH_FILE ]
+    then
+        echo "Repository successfully uninstalled"
+        exit 0
+    else
+        echo "Unable to uninstall repository, please do it manually."
+        exit 1
+    fi
+fi
+
+# Before we do anything else, check that the architecture and release
+# for which the tarball was created match the target.
+TARGET_DATA_FILE=$APT_ADD_REPOSITORY_DIR/target_data
+[ -f "$TARGET_DATA_FILE" ]  && . $TARGET_DATA_FILE
+THIS_DISTRIB_CODENAME=`lsb_release -cs`
+
+if [ -n "$DISTRIB_CODENAME" ] && \
+   [ "$THIS_DISTRIB_CODENAME" != "$DISTRIB_CODENAME" ]; then
+    echo "WARNING: Attempting to install $DISTRIB_CODENAME packages"
+    echo "on a $THIS_DISTRIB_CODENAME system. This will most likely fail."
+    echo "Press ENTER to continue despite this, or CTRL-C to stop without"
+    echo "installing anything."
+    read
+fi
+
+if [ -n "$ISO_ARCHITECTURE" ] && \
+   [ $(dpkg --print-architecture) != "$ISO_ARCHITECTURE" ]; then
+    echo "WARNING: Attempting to install $ISO_ARCHITECTURE packages"
+    echo -n "on a $(dpkg-architecture -qDEB_HOST_ARCH) system. "
+    echo "This will most likely fail."
+    echo "Press ENTER to continue despite this, or CTRL-C to stop without"
+    echo "installing anything."
+    read
+fi
+
+
+mkdir -p $REPO_DIR || { echo "Unable to create $REPO_DIR"; exit 1; }
+
+if ! cp $APT_ADD_REPOSITORY_DIR/*.deb $APT_ADD_REPOSITORY_DIR/Packages.gz $REPO_DIR; then
+    echo "Unable to copy packages to  $REPO_DIR"
+    exit 1
+fi
+
+# Once the files are in $REPO_DIR, add them to apt repository.
+# Adding a file in /etc/apt/sources.list.d is easier but then the remote
+# repos have priority over local ones, which breaks our script. Manipulation
+# of /etc/apt/sources.list is unfortunately necessary.
+DEBLINE="deb file://$REPO_DIR ./"
+
+echo "APT::Get::AllowUnauthenticated 1;" > $APT_ALLOW_UNAUTH_FILE
+if  ! sed -i.bak "1i $DEBLINE" /etc/apt/sources.list || \
+    [ ! -f  $APT_ALLOW_UNAUTH_FILE ]
+then
+    echo "Unable to configure local apt repository"
+    exit 1
+fi
+
+if [ -n "$PARAM_UPDATE" ]; then
+    # We don't check error code from apt-get update because if remote repos
+    # that are inaccessible fail, the local repo may still enable me to
+    # install what I need.
+    debconf-apt-progress -- apt-get update
+fi
+
+if [ -n "$PARAM_INSTALL_PACKAGES" ]; then
+    # debconf-apt-progress provides a nice progress bar, at the end it can
+    # output apt-get error messages in case installation failed.
+    if ! debconf-apt-progress --logfile $INSTALL_LOG \
+        -- apt-get install -y --force-yes $PARAM_INSTALL_PACKAGES; then
+        echo "Installing packages ($PARAM_INSTALL_PACKAGES) failed."
+        cat $INSTALL_LOG
+        exit 1
+    fi
+fi
+exit 0
